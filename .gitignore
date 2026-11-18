@@ -1,0 +1,25 @@
+# Python & Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment Variables & Secrets
+.env
+*.env
+!.env.example
+
+# Logs & Runtime
+*.log
+*.sqlite
+.DS_Store
+Thumbs.db
+
+# IDE & Editor caches
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
