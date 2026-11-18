@@ -3,6 +3,8 @@ audio/capture.py — VoiceBridge AI
 Dual-channel audio capture:
   Channel 1 (Loopback): Interviewer's audio via WASAPI loopback in isolated subprocess.
   Channel 2 (Mic):      Yago's microphone via sounddevice in a daemon thread.
+                        Supports normal mode (voice tracking) and --room-mic mode
+                        (1.75s silence gate for speakerphone interviews).
 
 Evolved from C:\\CacadorDeVagas\\tools\\cola_entrevista\\cola_entrevista.py
 Key pattern preserved: loopback MUST run in a subprocess (not a thread) —
@@ -17,6 +19,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 
 import numpy as np
 
@@ -72,10 +75,12 @@ class LoopbackCapture:
     """
     Spawns a child process that records WASAPI loopback audio and pushes
     complete utterance arrays into `output_queue`.
+    Calls on_activity() callback whenever loopback audio is detected or received.
     """
 
-    def __init__(self, output_queue: queue.Queue):
+    def __init__(self, output_queue: queue.Queue, on_activity=None):
         self._queue = output_queue
+        self._on_activity = on_activity
         self._process: subprocess.Popen | None = None
         self._thread: threading.Thread | None = None
         self._running = False
@@ -84,7 +89,6 @@ class LoopbackCapture:
         if self._running:
             return
         self._running = True
-        # Launch child process using this same file with --rec-loopback flag
         capture_script = os.path.abspath(__file__)
         self._process = subprocess.Popen(
             [sys.executable, "-W", "ignore", capture_script, "--rec-loopback"],
@@ -110,6 +114,11 @@ class LoopbackCapture:
                 if not raw or len(raw) < n:
                     break
                 audio = np.frombuffer(raw, dtype=np.float32)
+                if self._on_activity:
+                    try:
+                        self._on_activity()
+                    except Exception:
+                        pass
                 self._queue.put(audio)
             except Exception as exc:
                 logger.error("Loopback read error: %s", exc)
@@ -134,34 +143,52 @@ class LoopbackCapture:
 class MicCapture:
     """
     Captures audio from the default microphone using sounddevice.
-    Pushes short chunks (~0.5s) into `output_queue` for real-time transcription.
-    Uses a simple voice-activity gate so the transcriber isn't flooded with silence.
+    Supports two modes:
+      1. Default (room_mic=False): Short chunks (~0.5s) with ~2.0s silence flush,
+         used for live voice-tracking (rapidfuzz script matching).
+      2. Room Mic (room_mic=True): For speakerphone/room capture when call audio comes
+         from a smartphone beside the notebook. Accumulates speech and flushes after
+         calibrated 1.75s silence (7 chunks of 0.25s) directly as a complete question.
     """
 
-    def __init__(self, output_queue: queue.Queue, chunk_seconds: float = 0.5):
+    def __init__(
+        self,
+        output_queue: queue.Queue,
+        chunk_seconds: float = 0.5,
+        room_mic: bool = False,
+    ):
         self._queue = output_queue
-        self._chunk_frames = int(SAMPLE_RATE * chunk_seconds)
+        self.room_mic = room_mic
+        # For room mic, use 0.25s slices for precise 1.75s silence detection (7 chunks)
+        actual_chunk_sec = 0.25 if room_mic else chunk_seconds
+        self._chunk_frames = int(SAMPLE_RATE * actual_chunk_sec)
         self._thread: threading.Thread | None = None
         self._running = False
-        # Accumulation buffer: collect spoken chunks, flush after short silence
+
         self._buf: list[np.ndarray] = []
         self._silent_chunks = 0
-        self._rms_threshold = 0.008  # slightly lower than loopback; mic is closer
-        self._silence_flush = 4      # 4 × 0.5s = 2s silence → flush
+        self._rms_threshold = 0.01 if room_mic else 0.008
+        self._silence_flush = 7 if room_mic else 4  # 7 * 0.25s = 1.75s for room_mic
+        self._max_chunks = 120 if room_mic else 60  # max 30s
 
     def start(self) -> None:
         if self._running:
             return
         self._running = True
+        mode_str = "ROOM-MIC (1.75s silence gate)" if self.room_mic else "SPEECH-TRACK"
         self._thread = threading.Thread(target=self._record_loop, daemon=True, name="mic-capture")
         self._thread.start()
-        logger.info("MicCapture started")
+        logger.info("MicCapture started in mode: %s", mode_str)
 
     def _record_loop(self) -> None:
         import sounddevice as sd  # lazy import
 
-        with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-                            blocksize=self._chunk_frames) as stream:
+        with sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            dtype="float32",
+            blocksize=self._chunk_frames,
+        ) as stream:
             while self._running:
                 chunk, _ = stream.read(self._chunk_frames)
                 audio = chunk.flatten()
@@ -173,8 +200,8 @@ class MicCapture:
                 elif self._buf:
                     self._silent_chunks += 1
 
-                # Flush accumulated speech after silence gap
-                if self._buf and (self._silent_chunks >= self._silence_flush or len(self._buf) >= 60):
+                # Flush conditions
+                if self._buf and (self._silent_chunks >= self._silence_flush or len(self._buf) >= self._max_chunks):
                     combined = np.concatenate(self._buf).astype(np.float32)
                     self._buf.clear()
                     self._silent_chunks = 0
