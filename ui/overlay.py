@@ -272,16 +272,21 @@ class OverlayWindow(QWidget):
     # -----------------------------------------------------------------
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
-            self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            pos = event.globalPosition().toPoint() if hasattr(event, "globalPosition") else event.globalPos()
+            self._drag_pos = pos - self.frameGeometry().topLeft()
             event.accept()
+        super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
-        if self._drag_pos and event.buttons() & Qt.MouseButton.LeftButton:
-            self.move(event.globalPosition().toPoint() - self._drag_pos)
+        if self._drag_pos and (event.buttons() & Qt.MouseButton.LeftButton):
+            pos = event.globalPosition().toPoint() if hasattr(event, "globalPosition") else event.globalPos()
+            self.move(pos - self._drag_pos)
             event.accept()
+        super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
         self._drag_pos = None
+        super().mouseReleaseEvent(event)
 
     # -----------------------------------------------------------------
     # Actions & Controls

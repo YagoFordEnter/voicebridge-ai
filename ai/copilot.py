@@ -1,16 +1,14 @@
 """
 ai/copilot.py — VoiceBridge AI
 Live Interview Co-Pilot: receives the interviewer's transcribed question,
-sends it with Yago's technical profile to a fast LLM (Groq API), and
+sends it with Yago's technical profile to an LLM, and
 streams concise spoken-English bullet points for the teleprompter overlay.
 
-Evolved from C:\\CacadorDeVagas\\tools\\cola_entrevista\\cola_entrevista.py
-Key adaptations:
-  - Reads profile from config/profile_context.md (not hardcoded CEREBRO_YAGO)
-  - English output (cola_entrevista was Portuguese)
-  - PyQt6 signal-based UI update (not tkinter root.after)
-  - Clean separation: this module has zero UI imports
-  - Configurable model cascade with per-call .env hot-reload (from cola_entrevista)
+Features:
+  - Multi-provider support: Groq, DeepSeek, and local Ollama via OpenAI-compatible SDK
+  - Hot-reloads .env on every call (allows dynamic key/provider changes without restart)
+  - Resilient model cascading: tries primary model, falls back to lightweight model on failure/404
+  - Formatted for spoken English (<80 words, opening line + short bullets + "|" pause markers)
 """
 from __future__ import annotations
 
@@ -19,7 +17,7 @@ import os
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Any
 
 from dotenv import load_dotenv
 
@@ -39,15 +37,22 @@ _PROFILE_PATH = _PROJECT_ROOT / "config" / "profile_context.md"
 @dataclass
 class CopilotConfig:
     """All tunables for the LLM co-pilot."""
-    # Groq model cascade (try in order; first success wins)
+    provider: str = "groq"           # "groq", "deepseek", or "ollama"
+    # Groq cascade: primary high-quality OSS model, followed by fast 20b fallback
     groq_models: list[str] = field(default_factory=lambda: [
-        "llama-3.3-70b-versatile",   # best quality, free tier
-        "openai/gpt-oss-120b",       # strong fallback
-        "openai/gpt-oss-20b",        # lightweight fallback
+        "openai/gpt-oss-120b",
+        "openai/gpt-oss-20b",
+    ])
+    deepseek_models: list[str] = field(default_factory=lambda: [
+        "deepseek-chat",
+    ])
+    ollama_models: list[str] = field(default_factory=lambda: [
+        "llama3.2",
+        "qwen2.5:7b",
     ])
     max_tokens: int = 500
     temperature: float = 0.3
-    timeout: int = 6                 # seconds per Groq call
+    timeout: int = 7                 # seconds per request
     history_window: int = 3          # keep last N transcript chunks for context
     profile_path: Path = _PROFILE_PATH
     env_path: Path = _ENV_PATH
@@ -85,7 +90,6 @@ def _load_profile(path: Path) -> str:
     except Exception as exc:
         logger.warning("Error reading profile: %s — using fallback", exc)
 
-    # Minimal fallback so the system prompt is never empty
     return (
         "Yago Santos Silva — ADS student at Senac São Paulo.\n"
         "PICTA Accessibility Researcher: WCAG 2.1/2.2, NVDA, Axe, WAVE, Lighthouse audits.\n"
@@ -103,11 +107,11 @@ def _load_profile(path: Path) -> str:
 class CopilotEngine:
     """
     Receives interviewer transcript chunks, accumulates recent history,
-    calls the Groq API with streaming, and delivers tokens to a callback.
+    calls the configured LLM API (Groq, DeepSeek, Ollama) with streaming,
+    and delivers tokens to callbacks.
 
-    Thread-safe: each `generate()` call runs in its own daemon thread.
-    Hot-reloads .env on every call (so pasting a new API key works instantly,
-    exactly like cola_entrevista.py does).
+    Thread-safe: each `feed_question()` call kicks off generation in a daemon thread.
+    Hot-reloads .env on every call (allows dynamic key/provider changes without restart).
     """
 
     def __init__(
@@ -116,31 +120,29 @@ class CopilotEngine:
         on_complete: Callable[[str], None] | None = None,
         on_error: Callable[[str], None] | None = None,
         config: CopilotConfig | None = None,
+        client_override: Any | None = None,  # for dependency injection in unit tests
     ):
-        """
-        Args:
-            on_token:    called with each streamed token (for live overlay update)
-            on_complete: called with the full response text when streaming finishes
-            on_error:    called with error message string
-        """
         self.cfg = config or CopilotConfig()
         self._on_token = on_token
         self._on_complete = on_complete
         self._on_error = on_error
+        self._client_override = client_override
 
         self._history: list[str] = []
         self._lock = threading.Lock()
         self._generating = False
 
-        # Build system prompt once; profile is loaded at init and can be refreshed
         self._profile_text = _load_profile(self.cfg.profile_path)
-        self._system_prompt = _SYSTEM_TEMPLATE.format(profile=self._profile_text)
+        self._system_prompt = self._build_system_prompt()
         logger.info("CopilotEngine initialized (profile: %d chars)", len(self._profile_text))
 
+    def _build_system_prompt(self) -> str:
+        return _SYSTEM_TEMPLATE.format(profile=self._profile_text)
+
     def reload_profile(self) -> None:
-        """Re-read profile_context.md (e.g. after the user edits it mid-session)."""
+        """Re-read profile_context.md (e.g. after editing mid-session)."""
         self._profile_text = _load_profile(self.cfg.profile_path)
-        self._system_prompt = _SYSTEM_TEMPLATE.format(profile=self._profile_text)
+        self._system_prompt = self._build_system_prompt()
         logger.info("Profile reloaded (%d chars)", len(self._profile_text))
 
     @property
@@ -149,7 +151,7 @@ class CopilotEngine:
 
     def feed_question(self, transcript_chunk: str) -> None:
         """
-        Called when a new loopback transcript arrives (the interviewer's words).
+        Called when a new transcript arrives (the interviewer's speech).
         Appends to rolling history and kicks off LLM generation in a thread.
         """
         if not transcript_chunk.strip():
@@ -157,8 +159,6 @@ class CopilotEngine:
 
         with self._lock:
             self._history.append(transcript_chunk.strip())
-            # Keep only last N chunks (questions can arrive in 2-3 pieces,
-            # exactly like cola_entrevista.py's HIST pattern)
             if len(self._history) > self.cfg.history_window:
                 self._history = self._history[-self.cfg.history_window:]
             combined = " ".join(self._history)
@@ -167,20 +167,74 @@ class CopilotEngine:
             target=self._generate, args=(combined,), daemon=True, name="copilot-gen"
         ).start()
 
+    def generate_sync(self, question_text: str) -> str:
+        """Synchronous version for automated QA, CLI testing and benchmarks."""
+        result: list[str] = []
+        error_holder: list[str] = []
+
+        old_token = self._on_token
+        old_complete = self._on_complete
+        old_error = self._on_error
+
+        self._on_token = lambda t: None
+        self._on_complete = lambda full: result.append(full)
+        self._on_error = lambda err: error_holder.append(err)
+
+        try:
+            self._generate(question_text)
+        finally:
+            self._on_token = old_token
+            self._on_complete = old_complete
+            self._on_error = old_error
+
+        if error_holder and not result:
+            raise RuntimeError(error_holder[0])
+        return result[0] if result else ""
+
+    def _get_provider_setup(self) -> tuple[str, list[str], Any]:
+        """Resolves active provider, model list, and initialized client."""
+        if self._client_override is not None:
+            return "override", ["test-model-1", "test-model-2"], self._client_override
+
+        provider = os.getenv("LLM_PROVIDER", self.cfg.provider).lower().strip()
+
+        if provider == "deepseek":
+            api_key = os.getenv("DEEPSEEK_API_KEY")
+            if not api_key:
+                raise ValueError("DEEPSEEK_API_KEY not found in .env for provider 'deepseek'")
+            base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+            model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+            from openai import OpenAI
+            client = OpenAI(api_key=api_key, base_url=base_url, timeout=self.cfg.timeout)
+            return "deepseek", [model], client
+
+        elif provider == "ollama":
+            base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+            model = os.getenv("OLLAMA_MODEL", "llama3.2")
+            from openai import OpenAI
+            client = OpenAI(api_key="ollama", base_url=base_url, timeout=self.cfg.timeout)
+            return "ollama", [model] + self.cfg.ollama_models, client
+
+        else:
+            # Default: Groq
+            api_key = os.getenv("GROQ_API_KEY")
+            if not api_key:
+                raise ValueError("GROQ_API_KEY not found in .env for provider 'groq'")
+            from groq import Groq
+            client = Groq(api_key=api_key, max_retries=0, timeout=self.cfg.timeout)
+            return "groq", self.cfg.groq_models, client
+
     def _generate(self, question_text: str) -> None:
-        """Run Groq API streaming in a background thread."""
+        """Runs streaming LLM generation with cascading model fallback."""
         self._generating = True
         try:
-            # Hot-reload .env so a freshly pasted API key works without restart
-            # (validated pattern from cola_entrevista.py line 123)
             load_dotenv(str(self.cfg.env_path), override=True)
 
-            groq_key = os.getenv("GROQ_API_KEY")
-            if not groq_key:
-                self._emit_error("GROQ_API_KEY not found in .env — paste it and retry")
+            try:
+                provider_name, models_to_try, client = self._get_provider_setup()
+            except Exception as e:
+                self._emit_error(str(e))
                 return
-
-            from groq import Groq
 
             messages = [
                 {"role": "system", "content": self._system_prompt},
@@ -188,20 +242,19 @@ class CopilotEngine:
             ]
 
             full_response = ""
+            last_exception: Exception | None = None
 
-            # Try each model in the cascade (validated pattern from cola_entrevista.py)
-            for model_name in self.cfg.groq_models:
+            for model_name in models_to_try:
                 try:
-                    client = Groq(max_retries=0, timeout=self.cfg.timeout)
-                    kwargs = {
+                    logger.info("Attempting copilot generation via [%s] model: %s", provider_name, model_name)
+                    kwargs: dict[str, Any] = {
                         "model": model_name,
                         "max_tokens": self.cfg.max_tokens,
                         "stream": True,
                         "messages": messages,
                     }
-                    # Only some models support temperature; reasoning models
-                    # use reasoning_effort instead
-                    if model_name.startswith("openai/"):
+
+                    if provider_name == "groq" and model_name.startswith("openai/"):
                         kwargs["reasoning_effort"] = "low"
                     else:
                         kwargs["temperature"] = self.cfg.temperature
@@ -209,30 +262,34 @@ class CopilotEngine:
                     stream = client.chat.completions.create(**kwargs)
 
                     for chunk in stream:
-                        token = chunk.choices[0].delta.content or ""
+                        delta = chunk.choices[0].delta
+                        token = getattr(delta, "content", None) or ""
                         if token:
                             full_response += token
                             if self._on_token:
                                 self._on_token(token)
 
-                    # Success — stop trying other models
-                    logger.info("Copilot response via %s (%d chars)", model_name, len(full_response))
-                    break
+                    if full_response.strip():
+                        logger.info("✓ Copilot response completed via %s (%d chars)", model_name, len(full_response))
+                        break
+                    else:
+                        logger.warning("Model %s returned empty text, falling back...", model_name)
 
                 except Exception as model_exc:
-                    logger.warning("Model %s failed: %s", model_name, model_exc)
-                    full_response = ""  # reset for next attempt
+                    logger.warning("Model %s failed: %s. Trying fallback if available...", model_name, model_exc)
+                    last_exception = model_exc
+                    full_response = ""
                     continue
             else:
-                # All models failed
-                self._emit_error("All Groq models failed — check API key and quota")
+                err_msg = f"All models failed for provider '{provider_name}': {last_exception}"
+                self._emit_error(err_msg)
                 return
 
             if full_response.strip() and self._on_complete:
                 self._on_complete(full_response.strip())
 
         except Exception as exc:
-            logger.error("Copilot generation error: %s", exc)
+            logger.error("Copilot generation unexpected error: %s", exc)
             self._emit_error(f"Copilot error: {exc}")
         finally:
             self._generating = False
@@ -246,7 +303,7 @@ class CopilotEngine:
                 pass
 
     def clear_history(self) -> None:
-        """Reset the question history (e.g. when switching interview topics)."""
+        """Reset question history."""
         with self._lock:
             self._history.clear()
         logger.info("Copilot history cleared")
