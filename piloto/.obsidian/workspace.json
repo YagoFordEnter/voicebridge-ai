@@ -114,7 +114,6 @@
             "state": {
               "type": "backlink",
               "state": {
-                "file": "WCAG.md",
                 "collapseAll": false,
                 "extraContext": false,
                 "sortOrder": "alphabetical",
@@ -133,7 +132,6 @@
             "state": {
               "type": "outgoing-link",
               "state": {
-                "file": "WCAG.md",
                 "linksCollapsed": false,
                 "unlinkedCollapsed": true
               },
@@ -176,7 +174,7 @@
             "state": {
               "type": "outline",
               "state": {
-                "file": "WCAG.md",
+                "file": "FRONT_ARCHITECTURE_ACCESSHOME_VISION.md",
                 "followCursor": false,
                 "showSearch": false,
                 "searchQuery": ""
@@ -203,9 +201,10 @@
       "bases:Criar nova base": false
     }
   },
-  "active": "3bf0c87e6e2ad324",
+  "active": "8671c634f9d4b0bc",
   "lastOpenFiles": [
-    "Piloto.md",
-    "WCAG.md"
+    "WCAG.md",
+    "FRONT_ARCHITECTURE_ACCESSHOME_VISION.md",
+    "Piloto.md"
   ]
 }
